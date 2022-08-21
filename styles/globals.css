@@ -1,0 +1,223 @@
+@import './fonts.css';
+@import './modals.css';
+
+/** These are from the new Umee Style guide*/
+:root {
+  --umee-color-primary: #070927;
+  --umee-full-white: #fff;
+  --umee-full-dark: #16183c;
+  --umee-dark-grey-on-navy: #464869;
+  --umee-mid-grey-on-navy: #a0a1ba;
+  --umee-full-grey1: #e2e3ed;
+  --umee-full-grey2: #62637b;
+  --umee-full-purple: #c9b8ff;
+  --umee-full-green: #4effe5;
+  --umee-full-green-50: rgba(78, 255, 229, 0.5);
+  --umee-full-pink: #dfb2ff;
+  --umee-full-pink-50: rgba(223, 178, 255, 0.5);
+  --umee-full-red: #ff0000;
+  --umee-gradient: linear-gradient(83.37deg, #fda9ff -9.48%, #c9b8ff 18.96%, #4dffe5 82.13%);
+  --umee-gradient-inverse: linear-gradient(273.37deg, #fda9ff -9.48%, #c9b8ff 18.96%, #4dffe5 82.13%);
+  --umee-overlay: rgba(22, 24, 60, 0.95);
+  --umee-overlay-dark: rgba(7, 9, 39, 0.95);
+  --umee-ease-out: cubic-bezier(0.075, 0.82, 0.165, 1);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+button,
+input,
+optgroup,
+select,
+textarea {
+  font-family: Helvetica;
+}
+
+html {
+  height: 100%;
+}
+
+html,
+body {
+  font-family: Helvetica, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen, Ubuntu, Cantarell, Fira Sans,
+    Droid Sans, Helvetica Neue, sans-serif !important;
+}
+
+.bg-transparent {
+  background-color: transparent !important;
+}
+
+a,
+span,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p {
+  color: #16183c;
+  line-height: normal !important;
+}
+
+a {
+  color: #5e72e4;
+  text-decoration: none;
+}
+
+a:hover {
+  color: #233dd2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+*:focus,
+a:visited,
+a:active {
+  box-shadow: none !important;
+}
+
+.shortence {
+  width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Chrome, Safari, Edge, Opera */
+input::-webkit-outer-spin-button,
+input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Firefox */
+input[type='number'] {
+  -moz-appearance: textfield;
+}
+
+.primary-button:hover {
+  background-position: 100% 50%;
+}
+.gradient-text {
+  width: fit-content;
+  background: linear-gradient(90deg, #fda9ff 6.98%, #4effe5 94.96%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.border-gradient-bottom.data-list-header {
+  padding-bottom: 8px;
+}
+
+.border-gradient-bottom {
+  border: 0px;
+  border-bottom: 2px solid;
+  border-image: linear-gradient(90deg, #fda9ff 0%, #c9b8ff 27.26%, #4dffe5 100%) 1;
+}
+
+.border-gradient-bottom-1 {
+  border-bottom: 1px solid;
+}
+
+.markets-filter-list {
+  display: -webkit-box !important;
+  overflow: auto;
+}
+
+.markets-detail-bottom {
+  position: fixed;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 100%;
+}
+
+.markets-detail-bottom-overlay {
+  position: absolute;
+  height: 100%;
+  left: 0;
+  width: 100%;
+  top: 0;
+  z-index: -1;
+  background: rgba(7, 9, 39, 0.2);
+  filter: blur(15px);
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0.4;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.markets-container {
+  opacity: 0;
+  min-height: 100vh !important;
+  position: relative;
+  animation: fadeIn 1s ease-out forwards;
+}
+
+.content {
+  max-width: 1440px !important;
+  width: 100%;
+}
+
+.letter-spacing {
+  letter-spacing: 0.1em;
+}
+
+.upper-case {
+  text-transform: uppercase;
+}
+
+.outline {
+  outline: 10px solid white;
+}
+
+.stake-manage,
+.stake-manage:hover {
+  border: none !important;
+  background: transparent;
+  box-shadow: none !important;
+  padding: 0 !important;
+}
+
+.outline-dark {
+  outline: 10px solid var(--umee-color-primary);
+}
+
+.centered {
+  position: absolute;
+  width: 100%;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+::-webkit-scrollbar {
+  -webkit-appearance: none;
+  width: 6px;
+  height: 3px;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 5px;
+  background-color: rgba(0, 0, 0, 0.1);
+  -webkit-box-shadow: 0 0 1px rgba(0, 0, 0, 0.3);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(0, 0, 0, 0.2);
+}
+
+.asset-card:not(:first-child) {
+  margin-top: 12px;
+}

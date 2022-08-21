@@ -1,0 +1,729 @@
+package db
+
+import (
+	"context"
+	"strings"
+
+	"cloud.google.com/go/bigquery"
+	"google.golang.org/api/iterator"
+)
+
+type DbConfig struct {
+	DatasetName string
+	TableName   string
+	ProjectName string
+}
+
+type Db struct {
+	DbConfig
+	*bigquery.Client
+}
+
+type SqlRecord = map[string]bigquery.Value
+
+type SqlResult []SqlRecord
+
+func sqlResultFromRowIterator(rows *bigquery.RowIterator) (SqlResult, error) {
+	out := SqlResult{}
+	for {
+		r := SqlRecord{}
+		err := rows.Next(&r)
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+
+	return out, nil
+}
+
+func NewDb(ctx context.Context, config DbConfig) (Db, error) {
+	bq, err := bigquery.NewClient(ctx, config.ProjectName)
+	if err != nil {
+		return Db{}, err
+	}
+
+	return Db{
+		DbConfig: config,
+		Client:   bq,
+	}, nil
+}
+
+func (db Db) Homepage(ctx context.Context) (SqlResult, error) {
+	q := db.Query(strings.ReplaceAll(`
+	WITH
+    daily_borrowed AS (
+      SELECT
+        DISTINCT(days.day),
+        COALESCE(borrowed.v_denom, "") v_denom,
+        COALESCE(borrowed.v_amount, 0) AS v_amount
+      FROM 'umee-testnet-alpha.astrolabe.days' days
+      LEFT JOIN 'umee-testnet-alpha.astrolabe.daily_borrowed' borrowed
+      ON borrowed.day = days.day
+      ORDER BY day ASC
+    ),
+    daily_repay_borrowed AS (
+      SELECT
+        days.day,
+        COALESCE(borrowed.v_denom, "") v_denom,
+        COALESCE(borrowed.v_amount, 0) AS v_amount
+      FROM 'umee-testnet-alpha.astrolabe.days' days
+      LEFT JOIN 'umee-testnet-alpha.astrolabe.daily_repay_borrowed' borrowed
+      ON borrowed.day = days.day
+      ORDER BY day ASC
+    ),
+    daily_loaned AS (
+      SELECT
+        DISTINCT(days.day),
+        COALESCE(loaned.v_denom, "") v_denom,
+        COALESCE(loaned.v_amount, 0) AS v_amount
+      FROM 'umee-testnet-alpha.astrolabe.days' days
+      LEFT JOIN 'umee-testnet-alpha.astrolabe.daily_loaned' loaned
+      ON loaned.day = days.day
+      ORDER BY day ASC
+    ),
+    daily_withdraw_loaned AS (
+      SELECT
+        days.day,
+        COALESCE(loaned.v_denom, "") v_denom,
+        COALESCE(loaned.v_amount, 0) AS v_amount
+      FROM 'umee-testnet-alpha.astrolabe.days' days
+      LEFT JOIN 'umee-testnet-alpha.astrolabe.daily_withdraw_loaned' loaned
+      ON loaned.day = days.day
+      ORDER BY day ASC
+    ),
+	-- XXX u/umee -> uumee to track source amount borrowed
+    borrowed_umee AS (
+      SELECT
+        days.day,
+        COALESCE(borrowed.v_denom, "uumee") v_denom,
+        COALESCE(borrowed.v_amount, 0) AS v_amount
+      FROM 'umee-testnet-alpha.astrolabe.days' days
+      LEFT JOIN 'umee-testnet-alpha.astrolabe.daily_borrowed' borrowed
+      ON borrowed.v_denom IN ("uumee", "u/uumee") AND borrowed.day = days.day
+      ORDER BY day ASC
+    ),
+	loaned_umee AS (
+      SELECT
+        days.day,
+        COALESCE(loaned.v_denom, "uumee") v_denom,
+        COALESCE(loaned.v_amount, 0) AS v_amount
+      FROM 'umee-testnet-alpha.astrolabe.days' days
+      LEFT JOIN 'umee-testnet-alpha.astrolabe.daily_loaned' loaned
+      ON loaned.v_denom IN ("uumee", "u/uumee") AND loaned.day = days.day
+      ORDER BY day ASC
+    ),
+
+	_borrow_prev AS (
+	  SELECT COUNT(*) AS borrow_count
+	  FROM 'umee-testnet-alpha.astrolabe.prev_messages'
+	  WHERE value = "/umeenetwork.umee.leverage.v1beta1.MsgBorrowAsset"
+	),
+	_borrow_cur AS (
+	  SELECT COUNT(*) AS borrow_count
+	  FROM 'umee-testnet-alpha.astrolabe.messages'
+	  WHERE value = "/umeenetwork.umee.leverage.v1beta1.MsgBorrowAsset"
+	),
+    _borrowed_volume_prev AS (
+		SELECT * FROM borrowed_umee
+		WHERE borrowed_umee.day between DATE_SUB(current_date(), INTERVAL 2 DAY) and DATE_SUB(current_date(), INTERVAL 1 DAY)
+		ORDER BY borrowed_umee.day ASC
+	),
+    _borrowed_volume_cur AS (
+		SELECT * FROM borrowed_umee
+		WHERE borrowed_umee.day between DATE_SUB(current_date(), INTERVAL 1 DAY) and current_date()
+		ORDER BY borrowed_umee.day ASC
+	),
+
+	_lend_prev AS (
+	  SELECT COUNT(*) AS lend_count
+	  FROM 'umee-testnet-alpha.astrolabe.prev_messages'
+	  WHERE value = "/umeenetwork.umee.leverage.v1beta1.MsgLendAsset"
+	),
+	_lend_cur AS (
+	  SELECT COUNT(*) AS lend_count
+	  FROM 'umee-testnet-alpha.astrolabe.messages'
+	  WHERE value = "/umeenetwork.umee.leverage.v1beta1.MsgLendAsset"
+	),
+	_loaned_volume_prev AS (
+		SELECT * FROM loaned_umee
+		WHERE loaned_umee.day between DATE_SUB(current_date(), INTERVAL 2 DAY) and DATE_SUB(current_date(), INTERVAL 1 DAY)
+		ORDER BY loaned_umee.day ASC
+	),
+    _loaned_volume_cur AS (
+		SELECT * FROM loaned_umee
+		WHERE loaned_umee.day between DATE_SUB(current_date(), INTERVAL 1 DAY) and current_date()
+		ORDER BY loaned_umee.day ASC
+	),
+
+	_ibc_prev AS (
+	  SELECT COUNT(*) AS lend_count
+	  FROM 'umee-testnet-alpha.astrolabe.prev_messages'
+	  WHERE value = "/ibc.applications.transfer.v1.MsgTransfer"
+	),
+	_ibc_cur AS (
+	  SELECT COUNT(*) AS lend_count
+	  FROM 'umee-testnet-alpha.astrolabe.messages'
+	  WHERE value = "/ibc.applications.transfer.v1.MsgTransfer"
+	),
+
+	-- eth stats
+	_eth_user_count_borrow_cur AS (
+		SELECT COUNT(DISTINCT user) AS eth_user_borrow_count
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp() - INTERVAL 1 day
+	),
+	_eth_user_count_borrow_prev AS (
+		SELECT COUNT(DISTINCT user) AS eth_user_borrow_count
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp() - INTERVAL 2 day
+	),
+	_eth_user_count_supply_cur AS (
+		SELECT COUNT(DISTINCT user) AS eth_user_supply_count
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp() - INTERVAL 1 day
+	),
+	_eth_user_count_supply_prev AS (
+		SELECT COUNT(DISTINCT user) AS eth_user_supply_count
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp() - INTERVAL 2 day
+	), 
+	_eth_uatom_volume_borrow_cur AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp() - INTERVAL 1 day 
+		AND reserve = "0x110bE24B5515DD08c0918B63660AE4eE5cEd3c9c"
+	), 
+	_eth_uatom_volume_borrow_prev AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 2 day 
+		AND reserve = "0x110bE24B5515DD08c0918B63660AE4eE5cEd3c9c"
+	),
+	_eth_dai_volume_borrow_cur AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 1 day 
+		AND reserve = "0xd787Ec2b6C962f611300175603741Db8438674a0"
+	), 
+	_eth_dai_volume_borrow_prev AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 2 day 
+		AND reserve = "0xd787Ec2b6C962f611300175603741Db8438674a0"
+	),
+	_eth_usdc_volume_borrow_cur AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 1 day 
+		AND reserve = "0x0Aa78575E17Ac357294Bb7B5a9ea512bA07669E2"
+	), 
+	_eth_usdc_volume_borrow_prev AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 2 day 
+		AND reserve = "0x0Aa78575E17Ac357294Bb7B5a9ea512bA07669E2"
+	),
+	_eth_usdt_volume_borrow_cur AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 1 day 
+		AND reserve = "0x77baa6A171e5084A9e7683B1F6658Bf330bf0011"
+	), 
+	_eth_usdt_volume_borrow_prev AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 2 day 
+		AND reserve = "0x77baa6A171e5084A9e7683B1F6658Bf330bf0011"
+	),
+	_eth_weth_volume_borrow_cur AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 1 day 
+		AND reserve = "0x8dcb75952C3e68627141bEF99Cf2A25f1F3270B4"
+	), 
+	_eth_weth_volume_borrow_prev AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.borrow_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 2 day 
+		AND reserve = "0x8dcb75952C3e68627141bEF99Cf2A25f1F3270B4"
+	), 
+	_eth_uatom_volume_supply_cur AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 1 day 
+		AND reserve = "0x110bE24B5515DD08c0918B63660AE4eE5cEd3c9c"
+	), 
+	_eth_uatom_volume_supply_prev AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 2 day 
+		AND reserve = "0x110bE24B5515DD08c0918B63660AE4eE5cEd3c9c"
+	),
+	_eth_dai_volume_supply_cur AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 1 day 
+		AND reserve = "0xd787Ec2b6C962f611300175603741Db8438674a0"
+	), 
+	_eth_dai_volume_supply_prev AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 2 day 
+		AND reserve = "0xd787Ec2b6C962f611300175603741Db8438674a0"
+	),
+	_eth_usdc_volume_supply_cur AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 1 day 
+		AND reserve = "0x0Aa78575E17Ac357294Bb7B5a9ea512bA07669E2"
+	), 
+	_eth_usdc_volume_supply_prev AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 2 day 
+		AND reserve = "0x0Aa78575E17Ac357294Bb7B5a9ea512bA07669E2"
+	),
+	_eth_usdt_volume_supply_cur AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp()- INTERVAL 1 day 
+		AND reserve = "0x77baa6A171e5084A9e7683B1F6658Bf330bf0011"
+	), 
+	_eth_usdt_volume_supply_prev AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp() - INTERVAL 2 day 
+		AND reserve = "0x77baa6A171e5084A9e7683B1F6658Bf330bf0011"
+	),
+	_eth_weth_volume_supply_cur AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp() - INTERVAL 1 day 
+		AND reserve = "0x8dcb75952C3e68627141bEF99Cf2A25f1F3270B4"
+	), 
+	_eth_weth_volume_supply_prev AS (
+		SELECT IFNULL(SUM(amount),0) as volume
+		FROM 'umee-testnet-alpha.ethereum.deposit_events_goerli'
+		WHERE timestamp >= current_timestamp() - INTERVAL 2 day 
+		AND reserve = "0x8dcb75952C3e68627141bEF99Cf2A25f1F3270B4"
+	),
+
+	-- markets queries
+	_uumee_borrow_volume_cur AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE v_denom = "uumee"
+		AND eventtype = "borrow_asset"
+	),
+    _uumee_borrow_volume_prev AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE v_denom = "uumee"
+		AND eventtype = "borrow_asset"
+	),
+	_atom_borrow_volume_cur AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE v_denom = "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2"
+		AND eventtype = "borrow_asset"
+	),
+    _atom_borrow_volume_prev AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE v_denom = "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2"
+		AND eventtype = "borrow_asset"
+	),
+	_osmo_borrow_volume_cur AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+		AND eventtype = "borrow_asset"
+	),
+    _osmo_borrow_volume_prev AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+		AND eventtype = "borrow_asset"
+	),
+	_juno_borrow_volume_cur AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE v_denom = "ibc/C814F0B662234E24248AE3B2FE2C1B54BBAF12934B757F6E7BC5AEC119963895"
+		AND eventtype = "borrow_asset"
+	),
+    _juno_borrow_volume_prev AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE v_denom = "ibc/C814F0B662234E24248AE3B2FE2C1B54BBAF12934B757F6E7BC5AEC119963895"
+		AND eventtype = "borrow_asset"
+	),
+	_uumee_supply_volume_cur AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE v_denom = "uumee"
+		AND eventtype = "lend_asset"
+	),
+    _uumee_supply_volume_prev AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE v_denom = "uumee"
+		AND eventtype = "lend_asset"
+	),
+	_atom_supply_volume_cur AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE v_denom = "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2"
+		AND eventtype = "lend_asset"
+	),
+    _atom_supply_volume_prev AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE v_denom = "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2"
+		AND eventtype = "lend_asset"
+	),
+	_osmo_supply_volume_cur AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+		AND eventtype = "lend_asset"
+	),
+    _osmo_supply_volume_prev AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+		AND eventtype = "lend_asset"
+	),
+	_juno_supply_volume_cur AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE v_denom = "ibc/C814F0B662234E24248AE3B2FE2C1B54BBAF12934B757F6E7BC5AEC119963895"
+		AND eventtype = "lend_asset"
+	),
+    _juno_supply_volume_prev AS (
+		SELECT IFNULL(sum(v_amount),0) as Amounts 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE v_denom = "ibc/C814F0B662234E24248AE3B2FE2C1B54BBAF12934B757F6E7BC5AEC119963895"
+		AND eventtype = "lend_asset"
+	),
+	
+	_uumee_borrow_count_cur AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE eventtype="borrow_asset"
+		 AND v_denom = "uumee"
+	), 
+	_uumee_borrow_count_prev AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE eventtype="borrow_asset"
+		 AND v_denom = "uumee"
+	), 
+	_uumee_supply_count_cur AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE eventtype="lend_asset"
+		AND v_denom = "uumee"
+	), 
+	_uumee_supply_count_prev AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE eventtype="lend_asset"
+		AND v_denom = "uumee"
+	), 
+
+	_atom_borrow_count_cur AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE eventtype="borrow_asset"
+		 AND v_denom = "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2"
+	), 
+	_atom_borrow_count_prev AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE eventtype="borrow_asset"
+		 AND v_denom = "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2"
+	), 
+	_atom_supply_count_cur AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE eventtype="lend_asset"
+		AND v_denom = "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2"
+	), 
+	_atom_supply_count_prev AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE eventtype="lend_asset"
+		AND v_denom = "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2"
+	), 
+
+	_osmo_borrow_count_cur AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE eventtype="borrow_asset"
+		 AND v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+	), 
+	_osmo_borrow_count_prev AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE eventtype="borrow_asset"
+		 AND v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+	), 
+	_osmo_supply_count_cur AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE eventtype="lend_asset"
+		AND v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+	), 
+	_osmo_supply_count_prev AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE eventtype="lend_asset"
+		AND v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+	), 
+	_juno_borrow_count_cur AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE eventtype="borrow_asset"
+		 AND v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+	), 
+	_juno_borrow_count_prev AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE eventtype="borrow_asset"
+		 AND v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+	), 
+	_juno_supply_count_cur AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.amounts'  
+		WHERE eventtype="lend_asset"
+		AND v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+	), 
+	_juno_supply_count_prev AS (
+		SELECT count(distinct txhash) as count 
+		FROM 'umee-testnet-alpha.astrolabe.prev_amounts'  
+		WHERE eventtype="lend_asset"
+		AND v_denom = "ibc/646315E3B0461F5FA4C5C8968A88FC45D4D5D04A45B98F1B8294DD82F386DD85"
+	),
+	_historical_prices AS (
+		SELECT date as date, price as price
+		FROM 'umee-testnet-alpha.historical_prices.umee' 
+		ORDER BY date desc
+	),_borrow_volume_eth_dai AS (
+		SELECT days as date, amounts as amount
+		FROM 'umee-testnet-alpha.ethereum.day_borrow_volume_dai' 
+		ORDER BY date desc
+	),_borrow_volume_eth_atom AS (
+		SELECT days as date, amounts as amount
+		FROM 'umee-testnet-alpha.ethereum.day_borrow_volume_atom' 
+		ORDER BY date desc
+	),_borrow_volume_eth_usdc AS (
+		SELECT days as date, amounts as amount
+		FROM 'umee-testnet-alpha.ethereum.day_borrow_volume_usdc' 
+		ORDER BY date desc
+	),_borrow_volume_eth_usdt AS (
+		SELECT days as date, amounts as amount
+		FROM 'umee-testnet-alpha.ethereum.day_borrow_volume_usdt' 
+		ORDER BY date desc
+	),_borrow_volume_eth_weth AS (
+		SELECT days as date, amounts as amount
+		FROM 'umee-testnet-alpha.ethereum.day_borrow_volume_weth' 
+		ORDER BY date desc
+	),_deposit_volume_eth_dai AS (
+		SELECT days as date, amounts as amount
+		FROM 'umee-testnet-alpha.ethereum.day_deposit_volume_dai' 
+		ORDER BY date desc
+	),_deposit_volume_eth_atom AS (
+		SELECT days as date, amounts as amount
+		FROM 'umee-testnet-alpha.ethereum.day_deposit_volume_atom' 
+		ORDER BY date desc
+	),_deposit_volume_eth_usdc AS (
+		SELECT days as date, amounts as amount
+		FROM 'umee-testnet-alpha.ethereum.day_deposit_volume_usdc' 
+		ORDER BY date desc
+	),_deposit_volume_eth_usdt AS (
+		SELECT days as date, amounts as amount
+		FROM 'umee-testnet-alpha.ethereum.day_deposit_volume_usdt' 
+		ORDER BY date desc
+	),_deposit_volume_eth_weth AS (
+		SELECT days as date, amounts as amount
+		FROM 'umee-testnet-alpha.ethereum.day_deposit_volume_weth' 
+		ORDER BY date desc
+	),_test_data AS (
+		SELECT 
+		day,
+		sum(v_amount) as v_amount,
+		"uumee" as v_denom,
+		FROM
+		(
+		SELECT
+		  days.day,
+		  COALESCE(borrowed.v_denom, "") v_denom,
+		  COALESCE(borrowed.v_amount, 0) AS v_amount
+		FROM 'umee-testnet-alpha.astrolabe.days' days
+		LEFT JOIN 'umee-testnet-alpha.astrolabe.daily_repay_borrowed' borrowed
+		ON borrowed.day = days.day
+		UNION ALL
+		SELECT
+		  days.day,
+		  COALESCE(loaned.v_denom, "") v_denom,
+		  COALESCE(loaned.v_amount, 0) AS v_amount
+		FROM 'umee-testnet-alpha.astrolabe.days' days
+		LEFT JOIN 'umee-testnet-alpha.astrolabe.daily_withdraw_loaned' loaned
+		ON loaned.day = days.day
+		)X
+		WHERE x.v_denom = "uumee"
+		GROUP BY x.day
+		ORDER BY x.day ASC
+)  
+		
+	SELECT
+		-- charts
+		(SELECT ARRAY_AGG(daily_borrowed) FROM daily_borrowed) AS daily_borrowed,
+		(SELECT ARRAY_AGG(daily_repay_borrowed) FROM daily_repay_borrowed) AS daily_repay_borrowed,
+		(SELECT ARRAY_AGG(daily_loaned) FROM daily_loaned) AS daily_loaned,
+		(SELECT ARRAY_AGG(daily_withdraw_loaned) FROM daily_withdraw_loaned) AS daily_withdraw_loaned,
+		(SELECT ARRAY_AGG(_test_data) FROM _test_data) AS test_data,
+
+		-- borrowed stats
+		(SELECT * FROM _borrow_prev) AS borrow_prev_day_count,
+		(SELECT * FROM _borrow_cur) AS borrow_cur_day_count,
+		CASE WHEN (SELECT * FROM _borrow_prev) = 0 THEN 0 ELSE ((SELECT * FROM _borrow_cur) / (
+		SELECT * FROM _borrow_prev)) - 1 END AS borrow_percent_change,
+
+		(SELECT SUM(_borrowed_volume_prev.v_amount) FROM _borrowed_volume_prev) AS borrow_volume_prev_day,
+		(SELECT SUM(_borrowed_volume_cur.v_amount) FROM _borrowed_volume_cur) AS borrow_volume_cur_day,
+		CASE WHEN
+			(SELECT SUM(_borrowed_volume_prev.v_amount) FROM _borrowed_volume_prev) = 0 THEN 0
+		ELSE
+			((SELECT SUM(_borrowed_volume_cur.v_amount) FROM _borrowed_volume_cur) / (
+			SELECT SUM(_borrowed_volume_prev.v_amount) FROM _borrowed_volume_prev)) - 1 END AS borrow_volume_percent_change,
+
+		-- supply stats
+		(SELECT * FROM _lend_prev) AS lend_prev_day_count,
+		(SELECT * FROM _lend_cur) AS lend_cur_day_count,
+		CASE WHEN (SELECT * FROM _lend_prev) = 0 THEN 0 ELSE ((SELECT * FROM _lend_cur) / (
+		SELECT * FROM _lend_prev)) - 1 END AS lend_percent_change,
+
+		(SELECT SUM(_loaned_volume_prev.v_amount) FROM _loaned_volume_prev) AS lend_volume_prev_day,
+		(SELECT SUM(_loaned_volume_cur.v_amount) FROM _loaned_volume_cur) AS lend_volume_cur_day,
+		CASE WHEN
+			(SELECT SUM(_loaned_volume_prev.v_amount) FROM _loaned_volume_prev) = 0 THEN 0
+		ELSE
+			((SELECT SUM(_loaned_volume_cur.v_amount) FROM _loaned_volume_cur) / (
+			SELECT SUM(_loaned_volume_prev.v_amount) FROM _loaned_volume_prev)) - 1 END AS lend_volume_percent_change,
+
+		-- misc. stats
+		(SELECT * FROM _ibc_prev) AS ibc_prev_day_count,
+		(SELECT * FROM _ibc_cur) AS ibc_cur_day_count,
+		CASE WHEN (SELECT * FROM _ibc_prev) = 0 THEN 0 ELSE ((SELECT * FROM _ibc_cur) / (
+		SELECT * FROM _ibc_prev)) - 1 END AS ibc_percent_change,
+
+		-- eth. stats
+		(SELECT * FROM _eth_user_count_borrow_cur) AS eth_borrow_count_current,
+		(SELECT * FROM _eth_user_count_borrow_prev) AS eth_borrow_count_prev,
+
+		(SELECT * FROM _eth_user_count_supply_cur) AS eth_supply_count_current,
+		(SELECT * FROM _eth_user_count_supply_prev) AS eth_supply_count_prev,
+
+		(SELECT * FROM _eth_uatom_volume_borrow_cur) AS eth_borrow_uatom_volume_cur,
+		(SELECT * FROM _eth_uatom_volume_borrow_prev) AS eth_borrow_uatom_volume_prev,
+	
+		(SELECT * FROM _eth_dai_volume_borrow_cur) AS eth_borrow_dai_volume_cur,
+		(SELECT * FROM _eth_dai_volume_borrow_prev) AS eth_borrow_dai_volume_prev,
+
+		(SELECT * FROM _eth_usdc_volume_borrow_cur) AS eth_borrow_usdc_volume_cur,
+		(SELECT * FROM _eth_usdc_volume_borrow_prev) AS eth_borrow_usdc_volume_prev,
+
+		(SELECT * FROM _eth_usdt_volume_borrow_cur) AS eth_borrow_usdt_volume_cur,
+		(SELECT * FROM _eth_usdt_volume_borrow_prev) AS eth_borrow_usdt_volume_prev,
+
+		(SELECT * FROM _eth_weth_volume_borrow_cur) AS eth_borrow_weth_volume_cur,
+		(SELECT * FROM _eth_weth_volume_borrow_prev) AS eth_borrow_weth_volume_prev,
+
+		(SELECT * FROM _eth_uatom_volume_supply_cur) AS eth_supply_uatom_volume_cur,
+		(SELECT * FROM _eth_uatom_volume_supply_prev) AS eth_supply_uatom_volume_prev,
+
+		(SELECT * FROM _eth_dai_volume_supply_cur) AS eth_supply_dai_volume_cur,
+		(SELECT * FROM _eth_dai_volume_supply_prev) AS eth_supply_dai_volume_prev,
+
+		(SELECT * FROM _eth_usdc_volume_supply_cur) AS eth_supply_usdc_volume_cur,
+		(SELECT * FROM _eth_usdc_volume_supply_prev) AS eth_supply_usdc_volume_prev,
+
+		(SELECT * FROM _eth_usdt_volume_supply_cur) AS eth_supply_usdt_volume_cur,
+		(SELECT * FROM _eth_usdt_volume_supply_prev) AS eth_supply_usdt_volume_prev,
+ 
+		(SELECT * FROM _eth_weth_volume_supply_cur) AS eth_supply_weth_volume_cur,
+		(SELECT * FROM _eth_weth_volume_supply_prev) AS eth_supply_weth_volume_prev,
+
+		(SELECT * FROM _uumee_borrow_volume_cur) AS umee_borrow_volume_cur,
+		(SELECT * FROM _uumee_borrow_volume_prev) AS umee_borrow_volume_prev,
+
+		(SELECT * FROM _atom_borrow_volume_cur) AS atom_borrow_volume_cur,
+		(SELECT * FROM _atom_borrow_volume_prev) AS atom_borrow_volume_prev,
+
+		(SELECT * FROM _osmo_borrow_volume_cur) AS osmo_borrow_volume_cur,
+		(SELECT * FROM _osmo_borrow_volume_prev) AS osmo_borrow_volume_prev,
+
+		(SELECT * FROM _juno_borrow_volume_cur) AS juno_borrow_volume_cur,
+		(SELECT * FROM _juno_borrow_volume_prev) AS juno_borrow_volume_prev,
+
+		(SELECT * FROM _uumee_supply_volume_cur) AS umee_supply_volume_cur,
+		(SELECT * FROM _uumee_supply_volume_prev) AS umee_supply_volume_prev,
+
+		(SELECT * FROM _atom_supply_volume_cur) AS atom_supply_volume_cur,
+		(SELECT * FROM _atom_supply_volume_prev) AS atom_supply_volume_prev,
+
+		(SELECT * FROM _osmo_supply_volume_cur) AS osmo_supply_volume_cur,
+		(SELECT * FROM _osmo_supply_volume_prev) AS osmo_supply_volume_prev,
+
+		(SELECT * FROM _juno_supply_volume_cur) AS juno_supply_volume_cur,
+		(SELECT * FROM _juno_supply_volume_prev) AS juno_supply_volume_prev,
+
+		(SELECT * FROM _uumee_borrow_count_cur) AS umee_borrow_count_cur,
+		(SELECT * FROM _uumee_borrow_count_prev) AS umee_borrow_count_prev,
+
+		(SELECT * FROM _atom_borrow_count_cur) AS atom_borrow_count_cur,
+		(SELECT * FROM _atom_borrow_count_prev) AS atom_borrow_count_prev,
+
+		(SELECT * FROM _osmo_borrow_count_cur) AS osmo_borrow_count_cur,
+		(SELECT * FROM _osmo_borrow_count_prev) AS osmo_borrow_count_prev,
+
+		(SELECT * FROM _juno_borrow_count_cur) AS juno_borrow_count_cur,
+		(SELECT * FROM _juno_borrow_count_prev) AS juno_borrow_count_prev,
+
+		(SELECT * FROM _uumee_supply_count_cur) AS umee_supply_count_cur,
+		(SELECT * FROM _uumee_supply_count_prev) AS umee_supply_count_prev,
+
+		(SELECT * FROM _atom_supply_count_cur) AS atom_supply_count_cur,
+		(SELECT * FROM _atom_supply_count_prev) AS atom_supply_count_prev,
+
+		(SELECT * FROM _osmo_supply_count_cur) AS osmo_supply_count_cur,
+		(SELECT * FROM _osmo_supply_count_prev) AS osmo_supply_count_prev,
+
+		(SELECT * FROM _juno_supply_count_cur) AS juno_supply_count_cur,
+		(SELECT * FROM _juno_supply_count_prev) AS juno_supply_count_prev,
+
+		(SELECT ARRAY_AGG(_historical_prices) FROM _historical_prices) AS historical_prices,
+		(SELECT ARRAY_AGG(_borrow_volume_eth_dai) FROM _borrow_volume_eth_dai) AS eth_borrow_volume_dai,
+		(SELECT ARRAY_AGG(_borrow_volume_eth_atom) FROM _borrow_volume_eth_atom) AS eth_borrow_volume_atom,
+		(SELECT ARRAY_AGG(_borrow_volume_eth_usdc) FROM _borrow_volume_eth_usdc) AS eth_borrow_volume_usdc,
+		(SELECT ARRAY_AGG(_borrow_volume_eth_usdt) FROM _borrow_volume_eth_usdt) AS eth_borrow_volume_usdt,
+		(SELECT ARRAY_AGG(_borrow_volume_eth_weth) FROM _borrow_volume_eth_weth) AS eth_borrow_volume_weth,
+		(SELECT ARRAY_AGG(_deposit_volume_eth_dai) FROM _deposit_volume_eth_dai) AS eth_deposit_volume_dai,
+		(SELECT ARRAY_AGG(_deposit_volume_eth_atom) FROM _deposit_volume_eth_atom) AS eth_deposit_volume_atom,
+		(SELECT ARRAY_AGG(_deposit_volume_eth_usdc) FROM _deposit_volume_eth_usdc) AS eth_deposit_volume_usdc,
+		(SELECT ARRAY_AGG(_deposit_volume_eth_usdt) FROM _deposit_volume_eth_usdt) AS eth_deposit_volume_usdt,
+		(SELECT ARRAY_AGG(_deposit_volume_eth_weth) FROM _deposit_volume_eth_weth) AS eth_deposit_volume_weth
+
+
+	`, "'", "`"))
+	rows, err := q.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return sqlResultFromRowIterator(rows)
+}

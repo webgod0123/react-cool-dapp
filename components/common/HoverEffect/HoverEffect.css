@@ -1,0 +1,12 @@
+.hover-light, .hover-dark {
+  cursor: pointer;
+  transition: .3s ease background-color;
+}
+
+.hover-light:hover {
+  background-color: var(--umee-full-grey1);
+}
+
+.hover-dark:hover {
+  background-color: var(--umee-dark-grey-on-navy);
+}
